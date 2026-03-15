@@ -136,16 +136,12 @@ impl ReadaheadPrefetcher {
 
         use std::os::unix::io::AsRawFd;
         let fd = file.as_raw_fd();
-        let mut off = offset;
-        let end = offset + length;
-        while off < end {
-            let count = ((end - off) as usize).min(128 * 1024);
-            #[allow(unsafe_code)]
-            let ret = unsafe { libc::readahead(fd, off, count) };
-            if ret < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            off += count as i64;
+        // readahead(2) accepts arbitrarily large counts; the kernel splits
+        // internally. One syscall per uncached range is enough.
+        #[allow(unsafe_code)]
+        let ret = unsafe { libc::readahead(fd, offset, length as usize) };
+        if ret < 0 {
+            return Err(std::io::Error::last_os_error());
         }
 
         Ok(())
@@ -182,7 +178,10 @@ impl MadvisePrefetcher {
         true
     }
 
-    fn do_madvise(
+    /// Single-pass prefetch: one mmap covers mincore check and madvise together,
+    /// avoiding the redundant mmap that `execute_concurrent` + `uncached_ranges`
+    /// would otherwise require.
+    fn do_madvise_fused(
         path: &std::path::Path,
         offset: i64,
         length: i64,
@@ -193,47 +192,118 @@ impl MadvisePrefetcher {
             return Ok(());
         }
 
+        #[allow(unsafe_code)]
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+        if page_size == 0 {
+            return Err(std::io::Error::other("sysconf(_SC_PAGESIZE) failed"));
+        }
+
+        let orig_start = offset as usize;
+        let orig_end = orig_start + length as usize;
+        let aligned_offset = orig_start & !(page_size - 1);
+        let aligned_end = (orig_end + page_size - 1) & !(page_size - 1);
+        let aligned_length = aligned_end - aligned_offset;
+
+        let map_len = NonZeroUsize::new(aligned_length)
+            .ok_or_else(|| std::io::Error::other("zero aligned length"))?;
+
         let file = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOCTTY | libc::O_NOATIME)
             .open(path)?;
 
-        let len = NonZeroUsize::new(length as usize)
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "zero length"))?;
-
         #[allow(unsafe_code)]
         let addr = unsafe {
             mman::mmap(
                 None,
-                len,
+                map_len,
                 mman::ProtFlags::PROT_READ,
                 mman::MapFlags::MAP_PRIVATE,
                 &file,
-                offset,
+                aligned_offset as i64,
             )
             .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?
         };
 
+        let base = addr.as_ptr() as usize;
+        let num_pages = aligned_length / page_size;
+        let mut mincore_vec = vec![0u8; num_pages];
+
         #[allow(unsafe_code)]
-        let result = unsafe {
-            mman::madvise(addr, length as usize, mman::MmapAdvise::MADV_WILLNEED)
-                .map_err(|e| std::io::Error::from_raw_os_error(e as i32))
+        let mincore_ok = unsafe {
+            libc::mincore(
+                addr.as_ptr() as *mut libc::c_void,
+                aligned_length,
+                mincore_vec.as_mut_ptr(),
+            ) == 0
         };
+
+        // Issue madvise(WILLNEED) for [abs_start, abs_end) within the mapping,
+        // clamped to the original [orig_start, orig_end) request.
+        let advise = |abs_start: usize, abs_end: usize| {
+            let start = abs_start.max(orig_start);
+            let end = abs_end.min(orig_end);
+            if end <= start {
+                return;
+            }
+            #[allow(unsafe_code)]
+            if let Some(nn) = std::ptr::NonNull::new(
+                (base + (start - aligned_offset)) as *mut libc::c_void,
+            ) {
+                #[allow(unsafe_code)]
+                let _ = unsafe {
+                    mman::madvise(nn, end - start, mman::MmapAdvise::MADV_WILLNEED)
+                };
+            }
+        };
+
+        if mincore_ok {
+            let mut run_start: Option<usize> = None;
+            for (i, &cached) in mincore_vec.iter().enumerate() {
+                let page_start = aligned_offset + i * page_size;
+                let page_end = page_start + page_size;
+
+                // Page entirely outside the requested range — flush any open run.
+                if page_end <= orig_start || page_start >= orig_end {
+                    if let Some(start) = run_start.take() {
+                        advise(start, page_start);
+                    }
+                    continue;
+                }
+
+                if (cached & 1) == 0 {
+                    run_start.get_or_insert(page_start);
+                } else if let Some(start) = run_start.take() {
+                    advise(start, page_start);
+                }
+            }
+            if let Some(start) = run_start {
+                advise(start, orig_end);
+            }
+        } else {
+            // mincore unavailable — advise the full mapped range.
+            #[allow(unsafe_code)]
+            let _ = unsafe {
+                mman::madvise(addr, aligned_length, mman::MmapAdvise::MADV_WILLNEED)
+            };
+        }
 
         #[allow(unsafe_code)]
         unsafe {
-            let _ = mman::munmap(addr, length as usize);
+            let _ = mman::munmap(addr, aligned_length);
         }
 
-        result
+        Ok(())
     }
 }
 
 #[async_trait]
 impl Prefetcher for MadvisePrefetcher {
     async fn execute(&self, plan: &PrefetchPlan, stores: &Stores) -> PrefetchReport {
-        execute_concurrent(plan, stores, self.concurrency, |path, offset, length| {
-            Self::do_madvise(path, offset, length)
+        // Use execute_concurrent_whole so that do_madvise_fused handles the
+        // mincore check internally — avoiding a redundant mmap/munmap pair.
+        execute_concurrent_whole(plan, stores, self.concurrency, |path, offset, length| {
+            Self::do_madvise_fused(path, offset, length)
         })
         .await
     }
@@ -367,8 +437,65 @@ fn uncached_ranges(
 }
 
 // ---------------------------------------------------------------------------
-// Shared concurrent execution helper
+// Shared concurrent execution helpers
 // ---------------------------------------------------------------------------
+
+/// Like [`execute_concurrent`] but calls `prefetch_fn(path, offset, length)`
+/// directly for the **full** map range, skipping the `uncached_ranges` step.
+/// Use this when the prefetch function handles its own mincore check internally.
+async fn execute_concurrent_whole<F>(
+    plan: &PrefetchPlan,
+    stores: &Stores,
+    concurrency: usize,
+    prefetch_fn: F,
+) -> PrefetchReport
+where
+    F: Fn(&std::path::Path, i64, i64) -> Result<(), std::io::Error> + Send + Sync + 'static + Clone,
+{
+    let mut report = PrefetchReport::default();
+    let concurrency = concurrency.max(1);
+
+    let tasks: Vec<(crate::domain::MapKey, std::sync::Arc<std::path::Path>, i64, i64)> = plan
+        .maps
+        .iter()
+        .filter_map(|map_id| {
+            let map = stores.maps.get(*map_id)?;
+            Some((
+                map.key(),
+                map.path.clone(),
+                map.offset as i64,
+                map.length as i64,
+            ))
+        })
+        .collect();
+
+    let mut stream = stream::iter(tasks).map(move |(map_key, path, offset, length)| {
+        let f = prefetch_fn.clone();
+        async move {
+            let join =
+                tokio::task::spawn_blocking(move || f(&path, offset, length)).await;
+            match join {
+                Ok(result) => (map_key, result),
+                Err(err) => (map_key, Err(std::io::Error::other(err))),
+            }
+        }
+    });
+
+    while let Some((map_key, result)) =
+        stream.by_ref().buffer_unordered(concurrency).next().await
+    {
+        match result {
+            Ok(()) => report.num_maps += 1,
+            Err(err) => {
+                debug!(?map_key, %err, "prefetch failed");
+                report.failures.push(map_key);
+            }
+        }
+    }
+
+    report.total_bytes = plan.total_bytes;
+    report
+}
 
 async fn execute_concurrent<F>(
     plan: &PrefetchPlan,
