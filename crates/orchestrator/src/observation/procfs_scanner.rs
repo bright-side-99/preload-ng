@@ -81,9 +81,16 @@ impl ProcfsScanner {
         let pagein = vm.get("pgpgin").map(|v| v * page / 1024).unwrap_or(0);
         let pageout = vm.get("pgpgout").map(|v| v * page / 1024).unwrap_or(0);
 
+        let slab_reclaim = mem.s_reclaimable.unwrap_or(0);
+        let reserves = (mem.mem_total / 200).max(64 * 1024 * 1024);
+        let available = mem
+            .mem_free
+            .saturating_add(slab_reclaim / 2)
+            .saturating_sub(reserves);
+
         Ok(MemStat {
             total: mem.mem_total / 1024,
-            available: mem.mem_available.unwrap_or(mem.mem_free + mem.cached) / 1024,
+            available: available / 1024,
             free: mem.mem_free / 1024,
             cached: mem.cached / 1024,
             pagein,
