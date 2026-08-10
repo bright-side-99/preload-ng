@@ -25,7 +25,12 @@ const SKIP_PREFIXES: &[&str] = &[
     "/var/lock/",
 ];
 
-const VIRTUAL_FILESYSTEMS: &[&str] = &[
+/// Pseudo, network, and container filesystems that should not get fanotify marks.
+///
+/// Opening or watching these can hang startup (stale NFS), flood the watcher
+/// (Docker overlays / snap squashfs), or only expose transient FUSE views.
+const SKIP_FILESYSTEMS: &[&str] = &[
+    // Kernel / pseudo
     "autofs",
     "bdev",
     "binfmt_misc",
@@ -37,22 +42,55 @@ const VIRTUAL_FILESYSTEMS: &[&str] = &[
     "devpts",
     "devtmpfs",
     "efivarfs",
-    "fuse.portal",
     "fusectl",
     "hugetlbfs",
     "mqueue",
     "nsfs",
+    "pipefs",
     "pstore",
     "proc",
     "ramfs",
+    "rpc_pipefs",
     "securityfs",
+    "selinuxfs",
     "sysfs",
     "tmpfs",
     "tracefs",
+    // Container / image
+    "overlay",
+    "squashfs",
+    "erofs",
+    // Network
+    "9p",
+    "afs",
+    "ceph",
+    "cephfs",
+    "cifs",
+    "glusterfs",
+    "lustre",
+    "nfs",
+    "nfs4",
+    "smb",
+    "smb3",
 ];
 
-fn is_virtual_filesystem(fs_type: &str) -> bool {
-    VIRTUAL_FILESYSTEMS.contains(&fs_type)
+/// Local FUSE drivers that back real disks (e.g. NTFS Steam libraries).
+const LOCAL_FUSE_FILESYSTEMS: &[&str] = &[
+    "fuseblk",
+    "fuse.exfat",
+    "fuse.ntfs",
+    "fuse.ntfs-3g",
+];
+
+fn should_skip_filesystem(fs_type: &str) -> bool {
+    if SKIP_FILESYSTEMS.contains(&fs_type) {
+        return true;
+    }
+    // Keep block-backed FUSE (NTFS/exFAT); skip gvfs/sshfs/portal/etc.
+    if LOCAL_FUSE_FILESYSTEMS.contains(&fs_type) {
+        return false;
+    }
+    fs_type == "fuse" || fs_type.starts_with("fuse.")
 }
 
 /// Decode the octal escapes used for whitespace and backslashes in mountinfo.
@@ -163,7 +201,7 @@ impl FanotifyWatcher {
         }))
     }
 
-    /// Mark each non-virtual filesystem in this process's mount namespace.
+    /// Mark each local disk filesystem in this process's mount namespace.
     ///
     /// FAN_MARK_FILESYSTEM on `/` does not follow mounts backed by a different
     /// filesystem, which would otherwise exclude common Steam libraries.
@@ -182,7 +220,7 @@ impl FanotifyWatcher {
         let mut marked = 0u32;
 
         for mount in mounts {
-            if is_virtual_filesystem(&mount.fs_type) {
+            if should_skip_filesystem(&mount.fs_type) {
                 continue;
             }
 
@@ -370,13 +408,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn virtual_filesystems_are_not_marked() {
-        assert!(is_virtual_filesystem("proc"));
-        assert!(is_virtual_filesystem("tmpfs"));
-        assert!(is_virtual_filesystem("fuse.portal"));
-        assert!(!is_virtual_filesystem("btrfs"));
-        assert!(!is_virtual_filesystem("ext4"));
-        assert!(!is_virtual_filesystem("fuseblk"));
+    fn noisy_or_remote_filesystems_are_not_marked() {
+        assert!(should_skip_filesystem("proc"));
+        assert!(should_skip_filesystem("tmpfs"));
+        assert!(should_skip_filesystem("overlay"));
+        assert!(should_skip_filesystem("squashfs"));
+        assert!(should_skip_filesystem("nfs4"));
+        assert!(should_skip_filesystem("cifs"));
+        assert!(should_skip_filesystem("fuse.portal"));
+        assert!(should_skip_filesystem("fuse.gvfsd-fuse"));
+        assert!(should_skip_filesystem("fuse.sshfs"));
+        assert!(!should_skip_filesystem("btrfs"));
+        assert!(!should_skip_filesystem("ext4"));
+        assert!(!should_skip_filesystem("fuseblk"));
+        assert!(!should_skip_filesystem("fuse.ntfs-3g"));
     }
 
     #[test]
