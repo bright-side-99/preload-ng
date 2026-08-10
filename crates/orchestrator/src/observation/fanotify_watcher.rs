@@ -4,9 +4,10 @@ use crate::domain::MapSegment;
 use crate::observation::ObservationEvent;
 use nix::sys::fanotify::{EventFFlags, Fanotify, InitFlags, MarkFlags, MaskFlags};
 use rustc_hash::FxHashMap;
+use std::collections::HashSet;
 use std::os::fd::AsRawFd;
 use std::os::linux::fs::MetadataExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -17,10 +18,71 @@ const SKIP_PREFIXES: &[&str] = &[
     "/sys/",
     "/dev/",
     "/tmp/",
-    "/run/",
+    "/run/user/",
+    "/run/lock/",
+    "/run/credentials/",
     "/var/run/",
     "/var/lock/",
 ];
+
+const VIRTUAL_FILESYSTEMS: &[&str] = &[
+    "autofs",
+    "bdev",
+    "binfmt_misc",
+    "cgroup",
+    "cgroup2",
+    "configfs",
+    "debugfs",
+    "devpts",
+    "devtmpfs",
+    "efivarfs",
+    "fuse.portal",
+    "fusectl",
+    "hugetlbfs",
+    "mqueue",
+    "nsfs",
+    "pstore",
+    "proc",
+    "ramfs",
+    "securityfs",
+    "sysfs",
+    "tmpfs",
+    "tracefs",
+];
+
+fn is_virtual_filesystem(fs_type: &str) -> bool {
+    VIRTUAL_FILESYSTEMS.contains(&fs_type)
+}
+
+/// Decode the octal escapes used for whitespace and backslashes in mountinfo.
+fn decode_mount_path(path: &Path) -> PathBuf {
+    let Some(raw) = path.to_str() else {
+        return path.to_path_buf();
+    };
+
+    let bytes = raw.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'\\'
+            && index + 3 < bytes.len()
+            && (b'0'..=b'7').contains(&bytes[index + 1])
+            && (b'0'..=b'7').contains(&bytes[index + 2])
+            && (b'0'..=b'7').contains(&bytes[index + 3])
+        {
+            let value = (u16::from(bytes[index + 1] - b'0') * 64)
+                + (u16::from(bytes[index + 2] - b'0') * 8)
+                + u16::from(bytes[index + 3] - b'0');
+            decoded.push(value as u8);
+            index += 4;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+
+    PathBuf::from(String::from_utf8_lossy(&decoded).into_owned())
+}
 
 #[derive(Debug, Clone, Copy)]
 struct FileMeta {
@@ -72,6 +134,8 @@ impl FanotifyWatcher {
             return None;
         }
 
+        Self::mark_mounted_filesystems(&fan);
+
         let buffer = Arc::new(Mutex::new(EventBuffer::default()));
         let stop = Arc::new(AtomicBool::new(false));
 
@@ -96,6 +160,80 @@ impl FanotifyWatcher {
             stop,
             handle: Some(handle),
         }))
+    }
+
+    /// Mark each non-virtual filesystem in this process's mount namespace.
+    ///
+    /// FAN_MARK_FILESYSTEM on `/` does not follow mounts backed by a different
+    /// filesystem, which would otherwise exclude common Steam libraries.
+    fn mark_mounted_filesystems(fan: &Fanotify) {
+        let mounts = match procfs::process::Process::myself()
+            .and_then(|process| process.mountinfo())
+        {
+            Ok(mounts) => mounts,
+            Err(err) => {
+                warn!(?err, "failed to enumerate mountpoints for fanotify");
+                return;
+            }
+        };
+
+        let mut marked_devices = HashSet::new();
+        let mut marked = 0u32;
+
+        for mount in mounts {
+            if is_virtual_filesystem(&mount.fs_type) {
+                continue;
+            }
+
+            let mount_point = decode_mount_path(&mount.mount_point);
+            if mount_point == Path::new("/") {
+                marked_devices.insert(mount.majmin.clone());
+                continue;
+            }
+            if marked_devices.contains(&mount.majmin) {
+                continue;
+            }
+
+            let file = match std::fs::File::open(&mount_point) {
+                Ok(file) => file,
+                Err(err) => {
+                    trace!(
+                        ?err,
+                        path = %mount_point.display(),
+                        fs_type = %mount.fs_type,
+                        "failed to open mountpoint for fanotify"
+                    );
+                    continue;
+                }
+            };
+
+            match fan.mark(
+                MarkFlags::FAN_MARK_ADD | MarkFlags::FAN_MARK_FILESYSTEM,
+                MaskFlags::FAN_OPEN,
+                &file,
+                None::<&Path>,
+            ) {
+                Ok(()) => {
+                    marked_devices.insert(mount.majmin.clone());
+                    marked += 1;
+                    trace!(
+                        path = %mount_point.display(),
+                        fs_type = %mount.fs_type,
+                        "fanotify filesystem mark added"
+                    );
+                }
+                Err(err) => {
+                    trace!(
+                        ?err,
+                        path = %mount_point.display(),
+                        fs_type = %mount.fs_type,
+                        "failed to mark filesystem for fanotify"
+                    );
+                }
+            }
+        }
+
+        info!(marked, "fanotify mounted filesystem marks added");
     }
 
     fn reader_loop(
@@ -223,6 +361,33 @@ impl FanotifyWatcher {
         }
 
         events
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn virtual_filesystems_are_not_marked() {
+        assert!(is_virtual_filesystem("proc"));
+        assert!(is_virtual_filesystem("tmpfs"));
+        assert!(is_virtual_filesystem("fuse.portal"));
+        assert!(!is_virtual_filesystem("btrfs"));
+        assert!(!is_virtual_filesystem("ext4"));
+        assert!(!is_virtual_filesystem("fuseblk"));
+    }
+
+    #[test]
+    fn mountinfo_path_escapes_are_decoded() {
+        assert_eq!(
+            decode_mount_path(Path::new("/run/media/andy/My\\040Games")),
+            Path::new("/run/media/andy/My Games")
+        );
+        assert_eq!(
+            decode_mount_path(Path::new("/mnt/Steam\\134Library")),
+            Path::new("/mnt/Steam\\Library")
+        );
     }
 }
 
