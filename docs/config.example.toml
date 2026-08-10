@@ -29,7 +29,7 @@ autosave = 3600
 # Executable path prefixes to include/exclude. "!" means deny. Longest match wins.
 exeprefix = ["!/usr/sbin/", "!/usr/local/sbin/", "/"]
 # Mapped file prefixes to include/exclude. "!" means deny. Longest match wins.
-mapprefix = ["!/proc/", "!/sys/", "!/dev/", "!/tmp/", "!/run/", "/"]
+mapprefix = ["!/proc/", "!/sys/", "!/dev/", "!/tmp/", "!/run/", "/run/media/", "/run/mnt/", "/"]
 # Enable fanotify file-open monitoring for broader prefetch coverage.
 # Requires CAP_SYS_ADMIN. Falls back gracefully if unavailable.
 fanotify = true

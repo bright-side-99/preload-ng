@@ -246,6 +246,16 @@ mod tests {
     }
 
     #[test]
+    fn default_policy_allows_mount_paths_outside_runtime_dirs() {
+        let config = Config::default();
+        let policy = DefaultAdmissionPolicy::new(&config);
+
+        assert!(policy.allow_map(Path::new("/run/media/library/file.so")));
+        assert!(policy.allow_map(Path::new("/run/mnt/library/file.so")));
+        assert!(!policy.allow_map(Path::new("/run/user/cache/file")));
+    }
+
+    #[test]
     fn decision_rejects_small() {
         let config = Config::default();
         let policy = DefaultAdmissionPolicy::new(&config);

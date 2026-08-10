@@ -66,6 +66,8 @@ impl Default for System {
                 "!/dev/".into(),
                 "!/tmp/".into(),
                 "!/run/".into(),
+                "/run/media/".into(),
+                "/run/mnt/".into(),
                 "/".into(),
             ],
             exeprefix: vec![

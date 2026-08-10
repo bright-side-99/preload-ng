@@ -24,6 +24,7 @@ This fork refines memory accounting, improves the prediction model, adds fanotif
 
 - **Denylist instead of allowlist for prefix defaults**: The original only prefetched files under `/usr/`, `/lib/`, and `/var/cache/`. Switched to a denylist that excludes `/proc/`, `/sys/`, `/dev/`, `/tmp/`, and `/run/`, allowing applications in `/home/`, `/opt/`, and other paths to be prefetched.
 - **fanotify file-open monitoring**: `/proc/[pid]/maps` only captures memory-mapped files. Added a `FAN_OPEN` watcher to discover files accessed via `read()` (icons, themes, configs, etc.). Falls back gracefully when `CAP_SYS_ADMIN` is unavailable.
+- **Mounted filesystem monitoring**: Fanotify now marks each non-virtual mounted filesystem, including separate Steam game drives, instead of monitoring only the root filesystem. Desktop mounts under `/run/media/` and `/run/mnt/` are admitted by default.
 
 ### Reliable prefetching
 
