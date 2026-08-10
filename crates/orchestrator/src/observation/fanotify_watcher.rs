@@ -29,6 +29,7 @@ const VIRTUAL_FILESYSTEMS: &[&str] = &[
     "autofs",
     "bdev",
     "binfmt_misc",
+    "bpf",
     "cgroup",
     "cgroup2",
     "configfs",
