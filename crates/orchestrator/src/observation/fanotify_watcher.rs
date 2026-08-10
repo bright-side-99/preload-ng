@@ -3,8 +3,7 @@
 use crate::domain::MapSegment;
 use crate::observation::ObservationEvent;
 use nix::sys::fanotify::{EventFFlags, Fanotify, InitFlags, MarkFlags, MaskFlags};
-use rustc_hash::FxHashMap;
-use std::collections::HashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::os::fd::AsRawFd;
 use std::os::linux::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -18,9 +17,6 @@ const SKIP_PREFIXES: &[&str] = &[
     "/sys/",
     "/dev/",
     "/tmp/",
-    "/run/user/",
-    "/run/lock/",
-    "/run/credentials/",
     "/var/run/",
     "/var/lock/",
 ];
@@ -30,7 +26,6 @@ const SKIP_PREFIXES: &[&str] = &[
 /// Opening or watching these can hang startup (stale NFS), flood the watcher
 /// (Docker overlays / snap squashfs), or only expose transient FUSE views.
 const SKIP_FILESYSTEMS: &[&str] = &[
-    // Kernel / pseudo
     "autofs",
     "bdev",
     "binfmt_misc",
@@ -56,11 +51,9 @@ const SKIP_FILESYSTEMS: &[&str] = &[
     "sysfs",
     "tmpfs",
     "tracefs",
-    // Container / image
     "overlay",
     "squashfs",
     "erofs",
-    // Network
     "9p",
     "afs",
     "ceph",
@@ -74,23 +67,26 @@ const SKIP_FILESYSTEMS: &[&str] = &[
     "smb3",
 ];
 
-/// Local FUSE drivers that back real disks (e.g. NTFS Steam libraries).
-const LOCAL_FUSE_FILESYSTEMS: &[&str] = &[
-    "fuseblk",
-    "fuse.exfat",
-    "fuse.ntfs",
-    "fuse.ntfs-3g",
-];
-
 fn should_skip_filesystem(fs_type: &str) -> bool {
     if SKIP_FILESYSTEMS.contains(&fs_type) {
         return true;
     }
     // Keep block-backed FUSE (NTFS/exFAT); skip gvfs/sshfs/portal/etc.
-    if LOCAL_FUSE_FILESYSTEMS.contains(&fs_type) {
-        return false;
+    match fs_type {
+        "fuseblk" | "fuse.exfat" | "fuse.ntfs" | "fuse.ntfs-3g" => false,
+        "fuse" => true,
+        other => other.starts_with("fuse."),
     }
-    fs_type == "fuse" || fs_type.starts_with("fuse.")
+}
+
+/// Match default mapprefix: deny most of `/run/`, allow desktop media mounts.
+fn should_skip_observed_path(path: &str) -> bool {
+    if SKIP_PREFIXES.iter().any(|prefix| path.starts_with(prefix)) {
+        return true;
+    }
+    path.starts_with("/run/")
+        && !path.starts_with("/run/media/")
+        && !path.starts_with("/run/mnt/")
 }
 
 /// Decode the octal escapes used for whitespace and backslashes in mountinfo.
@@ -98,6 +94,9 @@ fn decode_mount_path(path: &Path) -> PathBuf {
     let Some(raw) = path.to_str() else {
         return path.to_path_buf();
     };
+    if !raw.as_bytes().contains(&b'\\') {
+        return path.to_path_buf();
+    }
 
     let bytes = raw.as_bytes();
     let mut decoded = Vec::with_capacity(bytes.len());
@@ -155,25 +154,10 @@ impl FanotifyWatcher {
             }
         };
 
-        let root = match std::fs::File::open("/") {
-            Ok(f) => f,
-            Err(err) => {
-                warn!(?err, "failed to open / for fanotify mark");
-                return None;
-            }
-        };
-
-        if let Err(err) = fan.mark(
-            MarkFlags::FAN_MARK_ADD | MarkFlags::FAN_MARK_FILESYSTEM,
-            MaskFlags::FAN_OPEN,
-            &root,
-            None::<&std::path::Path>,
-        ) {
-            warn!(?err, "fanotify mark failed");
+        if Self::mark_mounted_filesystems(&fan) == 0 {
+            warn!("fanotify mark failed");
             return None;
         }
-
-        Self::mark_mounted_filesystems(&fan);
 
         let buffer = Arc::new(Mutex::new(EventBuffer::default()));
         let stop = Arc::new(AtomicBool::new(false));
@@ -205,74 +189,80 @@ impl FanotifyWatcher {
     ///
     /// FAN_MARK_FILESYSTEM on `/` does not follow mounts backed by a different
     /// filesystem, which would otherwise exclude common Steam libraries.
-    fn mark_mounted_filesystems(fan: &Fanotify) {
+    /// Returns how many filesystems were marked (0 means fanotify is unusable).
+    fn mark_mounted_filesystems(fan: &Fanotify) -> u32 {
         let mounts = match procfs::process::Process::myself()
             .and_then(|process| process.mountinfo())
         {
             Ok(mounts) => mounts,
             Err(err) => {
                 warn!(?err, "failed to enumerate mountpoints for fanotify");
-                return;
+                return u32::from(Self::try_mark_mount(fan, Path::new("/"), "root"));
             }
         };
 
-        let mut marked_devices = HashSet::new();
+        let mut marked_devices = FxHashSet::default();
         let mut marked = 0u32;
 
         for mount in mounts {
             if should_skip_filesystem(&mount.fs_type) {
                 continue;
             }
-
-            let mount_point = decode_mount_path(&mount.mount_point);
-            if mount_point == Path::new("/") {
-                marked_devices.insert(mount.majmin.clone());
-                continue;
-            }
             if marked_devices.contains(&mount.majmin) {
                 continue;
             }
 
-            let file = match std::fs::File::open(&mount_point) {
-                Ok(file) => file,
-                Err(err) => {
-                    trace!(
-                        ?err,
-                        path = %mount_point.display(),
-                        fs_type = %mount.fs_type,
-                        "failed to open mountpoint for fanotify"
-                    );
-                    continue;
-                }
-            };
-
-            match fan.mark(
-                MarkFlags::FAN_MARK_ADD | MarkFlags::FAN_MARK_FILESYSTEM,
-                MaskFlags::FAN_OPEN,
-                &file,
-                None::<&Path>,
-            ) {
-                Ok(()) => {
-                    marked_devices.insert(mount.majmin.clone());
-                    marked += 1;
-                    trace!(
-                        path = %mount_point.display(),
-                        fs_type = %mount.fs_type,
-                        "fanotify filesystem mark added"
-                    );
-                }
-                Err(err) => {
-                    trace!(
-                        ?err,
-                        path = %mount_point.display(),
-                        fs_type = %mount.fs_type,
-                        "failed to mark filesystem for fanotify"
-                    );
-                }
+            let mount_point = decode_mount_path(&mount.mount_point);
+            if !Self::try_mark_mount(fan, &mount_point, &mount.fs_type) {
+                continue;
             }
+
+            marked_devices.insert(mount.majmin);
+            marked += 1;
         }
 
         info!(marked, "fanotify mounted filesystem marks added");
+        marked
+    }
+
+    fn try_mark_mount(fan: &Fanotify, mount_point: &Path, fs_type: &str) -> bool {
+        let file = match std::fs::File::open(mount_point) {
+            Ok(file) => file,
+            Err(err) => {
+                trace!(
+                    ?err,
+                    path = %mount_point.display(),
+                    fs_type,
+                    "failed to open mountpoint for fanotify"
+                );
+                return false;
+            }
+        };
+
+        match fan.mark(
+            MarkFlags::FAN_MARK_ADD | MarkFlags::FAN_MARK_FILESYSTEM,
+            MaskFlags::FAN_OPEN,
+            &file,
+            None::<&Path>,
+        ) {
+            Ok(()) => {
+                trace!(
+                    path = %mount_point.display(),
+                    fs_type,
+                    "fanotify filesystem mark added"
+                );
+                true
+            }
+            Err(err) => {
+                trace!(
+                    ?err,
+                    path = %mount_point.display(),
+                    fs_type,
+                    "failed to mark filesystem for fanotify"
+                );
+                false
+            }
+        }
     }
 
     fn reader_loop(
@@ -328,12 +318,12 @@ impl FanotifyWatcher {
                     Err(_) => continue,
                 };
 
-                // Skip virtual/temp filesystems.
+                // Skip virtual/temp paths (and /run except desktop media mounts).
                 let path_str = match file_path.to_str() {
                     Some(s) => s,
                     None => continue,
                 };
-                if SKIP_PREFIXES.iter().any(|prefix| path_str.starts_with(prefix)) {
+                if should_skip_observed_path(path_str) {
                     continue;
                 }
 
@@ -422,6 +412,15 @@ mod tests {
         assert!(!should_skip_filesystem("ext4"));
         assert!(!should_skip_filesystem("fuseblk"));
         assert!(!should_skip_filesystem("fuse.ntfs-3g"));
+    }
+
+    #[test]
+    fn observed_paths_allow_desktop_media_mounts() {
+        assert!(should_skip_observed_path("/run/user/1000/bus"));
+        assert!(should_skip_observed_path("/run/systemd/units"));
+        assert!(!should_skip_observed_path("/run/media/andy/Games/lib.so"));
+        assert!(!should_skip_observed_path("/run/mnt/steam/game.bin"));
+        assert!(!should_skip_observed_path("/mnt/nvme/game.bin"));
     }
 
     #[test]
