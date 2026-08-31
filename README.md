@@ -54,6 +54,7 @@ This fork refines memory accounting, improves the prediction model, adds fanotif
 
 ### Operational improvements
 
+- **Automatic state pruning**: Stale executables and maps are dropped on load and before every save (age + count caps), then SQLite is vacuumed so `state.db` and daemon RAM stay bounded. Markov edges already aged out via `active_window`.
 - **Graceful shutdown on Ctrl+C during sleep**: The inter-tick sleep is now wrapped in `tokio::select!` with a cancellation token, so SIGINT is handled immediately instead of waiting for the cycle to complete.
 
 ## Usage

@@ -29,6 +29,10 @@ impl MapStore {
         self.maps.get(id)
     }
 
+    pub fn get_mut(&mut self, id: MapId) -> Option<&mut MapSegment> {
+        self.maps.get_mut(id)
+    }
+
     pub fn id_by_key(&self, key: &MapKey) -> Option<MapId> {
         self.by_key.get(key).copied()
     }
@@ -40,6 +44,10 @@ impl MapStore {
         } else {
             false
         }
+    }
+
+    pub fn len(&self) -> usize {
+        self.maps.len()
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (MapId, &MapSegment)> {

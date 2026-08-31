@@ -33,6 +33,19 @@ impl ExeStore {
         self.by_key.get(key).copied()
     }
 
+    pub fn remove(&mut self, id: ExeId) -> bool {
+        if let Some(exe) = self.exes.remove(id) {
+            self.by_key.remove(&exe.key);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.exes.len()
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = (ExeId, &Exe)> {
         self.exes.iter()
     }

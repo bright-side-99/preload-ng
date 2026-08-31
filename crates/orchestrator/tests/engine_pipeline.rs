@@ -199,6 +199,8 @@ async fn engine_persists_and_loads_state() {
     config.system.exeprefix = vec!["!/".into(), "/test/".into()];
     config.system.mapprefix = vec!["!/".into(), "/test/".into()];
     config.system.dopredict = false;
+    // Fake paths are not on disk; isolate persistence from missing-file prune.
+    config.persistence.drop_missing_files = false;
 
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("state.db");

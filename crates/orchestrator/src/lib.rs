@@ -27,4 +27,4 @@ pub use prefetch::{
 
 pub use clock::{Clock, SystemClock};
 pub use domain::{Exe, ExeId, ExeKey, MapId, MapKey, MapSegment, MarkovState, MemStat};
-pub use stores::Stores;
+pub use stores::{PrunePolicy, PruneReport, Stores};

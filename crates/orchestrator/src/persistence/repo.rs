@@ -10,7 +10,7 @@ use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use std::path::PathBuf;
 use std::time::SystemTime;
-use tracing::debug;
+use tracing::{debug, warn};
 
 #[async_trait]
 pub trait StateRepository: Send + Sync {
@@ -18,6 +18,11 @@ pub trait StateRepository: Send + Sync {
     async fn load(&self) -> Result<StoresSnapshot, Error>;
     /// Persist a snapshot.
     async fn save(&self, snapshot: &StoresSnapshot) -> Result<(), Error>;
+    /// Persist a snapshot, optionally running `VACUUM` afterward to reclaim file space.
+    async fn save_with_vacuum(&self, snapshot: &StoresSnapshot, vacuum: bool) -> Result<(), Error> {
+        let _ = vacuum;
+        self.save(snapshot).await
+    }
 }
 
 #[derive(Debug, Default)]
@@ -191,6 +196,22 @@ impl SqliteRepository {
 
         tx.commit().await?;
         debug!(path = %self.path.display(), "snapshot persisted");
+
+        // Truncate the WAL so companion files do not linger. Failure here
+        // must not fail the save: the snapshot is already committed.
+        if let Err(err) = sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+            .execute(&self.pool)
+            .await
+        {
+            warn!(error = %err, "wal checkpoint after save failed");
+        }
+
+        Ok(())
+    }
+
+    async fn vacuum(&self) -> Result<(), Error> {
+        sqlx::query("VACUUM").execute(&self.pool).await?;
+        debug!(path = %self.path.display(), "database vacuumed");
         Ok(())
     }
 
@@ -311,5 +332,14 @@ impl StateRepository for SqliteRepository {
 
     async fn save(&self, snapshot: &StoresSnapshot) -> Result<(), Error> {
         self.save_snapshot(snapshot).await
+    }
+
+    async fn save_with_vacuum(&self, snapshot: &StoresSnapshot, vacuum: bool) -> Result<(), Error> {
+        self.save_snapshot(snapshot).await?;
+        if vacuum && let Err(err) = self.vacuum().await {
+            // Snapshot is already on disk; failing save would stop the daemon.
+            warn!(error = %err, "vacuum after prune failed");
+        }
+        Ok(())
     }
 }
