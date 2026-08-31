@@ -10,7 +10,7 @@ use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use std::path::PathBuf;
 use std::time::SystemTime;
-use tracing::debug;
+use tracing::{debug, warn};
 
 #[async_trait]
 pub trait StateRepository: Send + Sync {
@@ -197,10 +197,14 @@ impl SqliteRepository {
         tx.commit().await?;
         debug!(path = %self.path.display(), "snapshot persisted");
 
-        // Truncate the WAL so companion files do not linger.
-        sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+        // Truncate the WAL so companion files do not linger. Failure here
+        // must not fail the save: the snapshot is already committed.
+        if let Err(err) = sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
             .execute(&self.pool)
-            .await?;
+            .await
+        {
+            warn!(error = %err, "wal checkpoint after save failed");
+        }
 
         Ok(())
     }
@@ -332,8 +336,9 @@ impl StateRepository for SqliteRepository {
 
     async fn save_with_vacuum(&self, snapshot: &StoresSnapshot, vacuum: bool) -> Result<(), Error> {
         self.save_snapshot(snapshot).await?;
-        if vacuum {
-            self.vacuum().await?;
+        if vacuum && let Err(err) = self.vacuum().await {
+            // Snapshot is already on disk; failing save would stop the daemon.
+            warn!(error = %err, "vacuum after prune failed");
         }
         Ok(())
     }

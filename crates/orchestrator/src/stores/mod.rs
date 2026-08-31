@@ -184,8 +184,21 @@ impl Stores {
 
         for (id, map) in self.maps.iter() {
             let orphan = self.exe_maps.exes_for_map(id).next().is_none();
-            let aged =
-                map_max_age_secs > 0 && now.saturating_sub(map.update_time) > map_max_age_secs;
+            // Historical snapshots stored first-seen in update_time, not last-seen.
+            // Do not age-drop a map whose attached exe was seen within map_max_age
+            // (or is running) — those maps are rediscovered on the next launch, but
+            // prefetch would miss until then.
+            let attached_recent = self.exe_maps.exes_for_map(id).any(|exe_id| {
+                self.exes.get(exe_id).is_some_and(|exe| {
+                    exe.running
+                        || exe
+                            .last_seen_time
+                            .is_some_and(|t| now.saturating_sub(t) <= map_max_age_secs)
+                })
+            });
+            let aged = map_max_age_secs > 0
+                && now.saturating_sub(map.update_time) > map_max_age_secs
+                && !attached_recent;
             let missing = policy.drop_missing_files && !map.path.exists();
             if orphan || aged || missing {
                 maps_to_drop.push(id);
@@ -347,7 +360,7 @@ mod tests {
             model_time: 1000,
             ..Default::default()
         };
-        let exe = make_exe(&mut stores, "/bin/app", Some(900), false);
+        let exe = make_exe(&mut stores, "/bin/app", Some(1), false);
         let old_map = make_map(&mut stores, "/lib/old.so", 1);
         let new_map = make_map(&mut stores, "/lib/new.so", 950);
         stores.attach_map(exe, old_map);
@@ -369,6 +382,28 @@ mod tests {
                 .id_by_key(&crate::domain::MapKey::new("/lib/new.so", 0, 4096))
                 .is_some()
         );
+    }
+
+    #[test]
+    fn keeps_old_update_time_maps_of_recent_exe() {
+        let mut stores = Stores {
+            model_time: 1000,
+            ..Default::default()
+        };
+        let exe = make_exe(&mut stores, "/bin/app", Some(950), false);
+        let map = make_map(&mut stores, "/lib/stale-stamp.so", 1);
+        stores.attach_map(exe, map);
+
+        let policy = PrunePolicy {
+            exe_max_age: Duration::from_secs(0),
+            map_max_age: Duration::from_secs(100),
+            max_exes: 0,
+            max_maps: 0,
+            drop_missing_files: false,
+        };
+        let report = stores.prune(&policy, 1000);
+        assert_eq!(report.maps_removed, 0);
+        assert_eq!(stores.maps.len(), 1);
     }
 
     #[test]
