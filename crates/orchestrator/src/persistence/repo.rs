@@ -18,6 +18,11 @@ pub trait StateRepository: Send + Sync {
     async fn load(&self) -> Result<StoresSnapshot, Error>;
     /// Persist a snapshot.
     async fn save(&self, snapshot: &StoresSnapshot) -> Result<(), Error>;
+    /// Persist a snapshot, optionally running `VACUUM` afterward to reclaim file space.
+    async fn save_with_vacuum(&self, snapshot: &StoresSnapshot, vacuum: bool) -> Result<(), Error> {
+        let _ = vacuum;
+        self.save(snapshot).await
+    }
 }
 
 #[derive(Debug, Default)]
@@ -191,6 +196,18 @@ impl SqliteRepository {
 
         tx.commit().await?;
         debug!(path = %self.path.display(), "snapshot persisted");
+
+        // Truncate the WAL so companion files do not linger.
+        sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+            .execute(&self.pool)
+            .await?;
+
+        Ok(())
+    }
+
+    async fn vacuum(&self) -> Result<(), Error> {
+        sqlx::query("VACUUM").execute(&self.pool).await?;
+        debug!(path = %self.path.display(), "database vacuumed");
         Ok(())
     }
 
@@ -311,5 +328,13 @@ impl StateRepository for SqliteRepository {
 
     async fn save(&self, snapshot: &StoresSnapshot) -> Result<(), Error> {
         self.save_snapshot(snapshot).await
+    }
+
+    async fn save_with_vacuum(&self, snapshot: &StoresSnapshot, vacuum: bool) -> Result<(), Error> {
+        self.save_snapshot(snapshot).await?;
+        if vacuum {
+            self.vacuum().await?;
+        }
+        Ok(())
     }
 }

@@ -225,6 +225,10 @@ impl MarkovGraph {
             })
     }
 
+    pub fn len(&self) -> usize {
+        self.keys.len()
+    }
+
     pub fn prune_inactive(&mut self, active: &FxHashSet<ExeId>) {
         let mut i = 0;
         while i < self.keys.len() {

@@ -10,7 +10,7 @@ use crate::persistence::{
 };
 use crate::prediction::{Prediction, Predictor};
 use crate::prefetch::{PrefetchPlanner, PrefetchReport, Prefetcher};
-use crate::stores::Stores;
+use crate::stores::{PrunePolicy, Stores};
 use config::Config;
 use std::time::{Instant, SystemTime};
 use tokio::sync::mpsc;
@@ -90,6 +90,18 @@ impl PreloadEngine {
                 stores.remove_map_by_key(key);
             }
             info!(removed = denied_keys.len(), "purged maps denied by prefix policy");
+        }
+
+        // Drop stale exes/maps so a bloated DB does not stay in RAM.
+        let policy = PrunePolicy::from(&config.persistence);
+        let report = stores.prune(&policy, stores.model_time);
+        if report.any_removed() {
+            info!(
+                exes_removed = report.exes_removed,
+                maps_removed = report.maps_removed,
+                edges_removed = report.edges_removed,
+                "pruned stale state on load"
+            );
         }
 
         Ok(Self {
@@ -254,9 +266,25 @@ impl PreloadEngine {
     }
 
     /// Persist current state via the configured repository.
-    pub async fn save(&self) -> Result<(), Error> {
+    ///
+    /// Prunes stale exes/maps first so the snapshot (and DB) stay bounded.
+    /// When pruning removed entries and `vacuum_after_prune` is enabled, the
+    /// SQLite file is vacuumed after the rewrite.
+    pub async fn save(&mut self) -> Result<(), Error> {
+        let policy = PrunePolicy::from(&self.config.persistence);
+        let report = self.stores.prune(&policy, self.stores.model_time);
+        if report.any_removed() {
+            info!(
+                exes_removed = report.exes_removed,
+                maps_removed = report.maps_removed,
+                edges_removed = report.edges_removed,
+                "pruned stale state before save"
+            );
+        }
+
         let snapshot = Self::snapshot_from_stores(&self.stores);
-        self.services.repo.save(&snapshot).await
+        let vacuum = report.any_removed() && self.config.persistence.vacuum_after_prune;
+        self.services.repo.save_with_vacuum(&snapshot, vacuum).await
     }
 
     /// Read-only access to in-memory stores (useful for tests).
@@ -924,7 +952,9 @@ mod tests {
         };
 
         let hits = Arc::new(AtomicU32::new(0));
-        let config = Config::default();
+        let mut config = Config::default();
+        // Isolate mapprefix purge from missing-file prune (fake paths are not on disk).
+        config.persistence.drop_missing_files = false;
         let services = Services {
             scanner: Box::new(StaticScanner),
             admission: Box::new(DenyTmpPolicy),

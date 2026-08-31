@@ -28,6 +28,10 @@ impl ActiveSet {
         removed
     }
 
+    pub fn remove(&mut self, exe_id: ExeId) {
+        self.last_seen.remove(&exe_id);
+    }
+
     pub fn exes(&self) -> FxHashSet<ExeId> {
         self.last_seen.keys().copied().collect()
     }

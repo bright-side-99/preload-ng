@@ -59,3 +59,15 @@ policy_cache_capacity = 1024
 # Optional override for autosave interval (seconds).
 # autosave_interval = 120
 save_on_shutdown = true
+# Drop executables not seen for this many seconds (model time). 0 disables. Default: 30 days.
+# exe_max_age = 2592000
+# Drop maps not re-observed for this many seconds (model time). 0 disables. Default: 14 days.
+# map_max_age = 1209600
+# Soft cap on tracked executables; oldest idle are dropped when exceeded. 0 disables.
+# max_exes = 8192
+# Soft cap on tracked maps; oldest unused by running exes are dropped. 0 disables.
+# max_maps = 65536
+# Also drop maps whose files no longer exist on disk.
+# drop_missing_files = true
+# Run SQLite VACUUM after a save that pruned entries (shrinks state.db).
+# vacuum_after_prune = true

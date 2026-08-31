@@ -120,6 +120,9 @@ impl ModelUpdater for DefaultModelUpdater {
                         let (map_id, is_new) = stores.ensure_map_with_flag(map);
                         if is_new {
                             delta.new_maps.push(map_key);
+                        } else if let Some(existing) = stores.maps.get_mut(map_id) {
+                            // Keep age-based map prune from dropping live maps.
+                            existing.update_time = now;
                         }
                         stores.attach_map(exe_id, map_id);
                     }

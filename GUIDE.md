@@ -108,6 +108,21 @@ Example: `memavailable = 90` means the planner can use 90% of available memory.
   `$XDG_CACHE_HOME/preload-ng/state.db` (`~/.cache/preload-ng/state.db`).
 - `autosave_interval`: Optional override for autosave (seconds).
 - `save_on_shutdown`: Save state when the process exits cleanly.
+- `exe_max_age`: Drop executables not seen for this many seconds of **model
+  time** (daemon uptime, not wall-clock). Default 30 days. `0` disables.
+- `map_max_age`: Drop maps not re-observed for this long. Default 14 days.
+  `0` disables.
+- `max_exes`: Soft cap on tracked executables. When exceeded after age prune,
+  oldest idle (not running) exes are dropped. Default 8192. `0` disables.
+- `max_maps`: Soft cap on tracked maps. Default 65536. `0` disables.
+- `drop_missing_files`: Also drop maps whose path no longer exists on disk
+  (default `true`).
+- `vacuum_after_prune`: After a save that removed entries, run SQLite
+  `VACUUM` so `state.db` shrinks (default `true`).
+
+Pruning runs on load and before every save (autosave, SIGUSR2, shutdown).
+Markov edges already age out with `active_window`; these knobs cover the
+executables and maps that otherwise grow forever.
 
 ## Common recipes
 
